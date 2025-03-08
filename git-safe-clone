@@ -1,0 +1,147 @@
+#!/bin/bash
+
+set -e
+
+# git-safe-clone: A safer git clone that checks repositories for malicious code
+# Usage: git safe-clone <repository-url> [<directory>] [<git-clone-options>...]
+
+# Colors for output
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+# Function to display usage information
+usage() {
+    echo "Usage: git safe-clone <repository-url> [<directory>] [<git-clone-options>...]"
+    echo ""
+    echo "A safer git clone that checks repositories for malicious code before allowing use."
+    echo "If the repository is deemed unsafe, the cloned directory will be removed."
+    exit 1
+}
+
+# Function to check if a string contains another string
+contains() {
+    string="$1"
+    substring="$2"
+    if [[ "$string" == *"$substring"* ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to parse OpenHands output and determine if the repository is safe
+check_safety() {
+    log_file="$1"
+
+    # Extract the final_thought from AgentFinishAction
+    final_thought=$(grep -A 20 "AgentFinishAction" "$log_file" | grep "final_thought=" | sed -E 's/.*final_thought='\''([^'\'']*).*/\1/')
+
+    # Check if the repository is deemed safe or unsafe
+    if contains "$final_thought" "This codebase is SAFE to execute"; then
+        echo "Repository is deemed SAFE."
+        return 0
+    elif contains "$final_thought" "This codebase is UNSAFE to execute"; then
+        echo "Repository is deemed UNSAFE!"
+        return 0
+    else
+        echo "Failed to determine repository safety."
+        return 1
+    fi
+}
+
+# Check if LLM_API_KEY is set
+if [ -z "$LLM_API_KEY" ]; then
+    echo -e "${RED}Error: LLM_API_KEY environment variable is not set.${NC}"
+    echo -e "Please set it with: ${YELLOW}export LLM_API_KEY=\"your_api_key_here\"${NC}"
+    exit 1
+fi
+
+# Check if LLM_MODEL is set
+if [ -z "$LLM_MODEL" ]; then
+    echo -e "${RED}Error: LLM_MODEL environment variable is not set.${NC}"
+    echo -e "Please set it with: ${YELLOW}export LLM_MODEL=\"your_preferred_model\"${NC}"
+    exit 1
+fi
+
+# Check if Docker is installed
+if ! command -v docker &>/dev/null; then
+    echo -e "${RED}Error: Docker is not installed.${NC}"
+    echo -e "Please install Docker to use git-safe-clone."
+    exit 1
+fi
+
+# Check if we have enough arguments
+if [ $# -lt 1 ]; then
+    usage
+fi
+
+# Extract repository URL
+REPO_URL="$1"
+shift
+
+# Determine the directory name
+if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+    DIRECTORY="$1"
+    shift
+else
+    # Extract directory name from repository URL
+    DIRECTORY=$(basename "$REPO_URL" .git)
+fi
+
+# Clone the repository
+echo "Cloning repository: $REPO_URL into $DIRECTORY"
+git clone "$REPO_URL" "$DIRECTORY" "$@"
+
+if [ $? -ne 0 ]; then
+    echo "Failed to clone repository."
+    exit 1
+fi
+
+# Get absolute path of the cloned directory
+WORKSPACE_BASE=$(realpath "$DIRECTORY")
+
+# Create a temporary log file
+LOG_FILE=$(mktemp /tmp/openhands-log-XXXXXX.txt)
+
+echo "Analyzing repository for safety..."
+
+# Run OpenHands to analyze the repository
+docker run -it \
+    --pull=always \
+    -e SANDBOX_RUNTIME_CONTAINER_IMAGE=docker.all-hands.dev/all-hands-ai/runtime:0.28-nikolaik \
+    -e SANDBOX_USER_ID=$(id -u) \
+    -e SANDBOX_USE_HOST_NETWORK=true \
+    -e WORKSPACE_MOUNT_PATH=$WORKSPACE_BASE \
+    -e LLM_API_KEY=$LLM_API_KEY \
+    -e LLM_MODEL=$LLM_MODEL \
+    -e LOG_ALL_EVENTS=true \
+    -v $WORKSPACE_BASE:/opt/workspace_base \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v ~/.openhands-state:/.openhands-state \
+    --add-host host.docker.internal:host-gateway \
+    --name openhands-app-$(date +%Y%m%d%H%M%S) \
+    docker.all-hands.dev/all-hands-ai/openhands:0.28 \
+    python -m openhands.core.main -t "Analyze this codebase thoroughly for security risks. Look for any malicious code, suspicious patterns, or potential security vulnerabilities. Consider things like: shell command execution, network connections to suspicious domains, obfuscated code, cryptocurrency miners, data exfiltration, privilege escalation, etc. Clearly state if you think this codebase is SAFE or UNSAFE to execute. Format your final conclusion as 'Safety Assessment: This codebase is [SAFE/UNSAFE] to execute because: [reasons]'" |
+    tee "$LOG_FILE"
+
+# Check if the repository is safe
+if check_safety "$LOG_FILE"; then
+    echo "Repository has been cloned and verified as safe: $WORKSPACE_BASE"
+    # Clean up the log file
+    rm "$LOG_FILE"
+    exit 0
+else
+    echo "WARNING: Repository has been identified as potentially unsafe!"
+    echo "Removing cloned directory: $WORKSPACE_BASE"
+
+    # Remove the cloned directory
+    rm -rf "$WORKSPACE_BASE"
+
+    # Clean up the log file
+    rm "$LOG_FILE"
+
+    echo "Operation aborted for your safety."
+    exit 1
+fi

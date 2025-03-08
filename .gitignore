@@ -1,0 +1,23 @@
+# Temporary files
+/tmp/
+*.tmp
+*.log
+
+# Test directories
+/test-repo/
+
+# Environment variables
+.env
+
+# OpenHands logs
+/openhands-log/*.txt
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Editor specific files
+.vscode/
+.idea/
+*.swp
+*.swo 
