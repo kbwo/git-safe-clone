@@ -1,0 +1,30 @@
+---
+description: Overview and basic concept
+globs: **/*
+alwaysApply: true
+---
+# Overview
+
+This project is a tool that provides a custom subcommand called `git safe-clone`. `git safe-clone` is a safe git clone that prevents cloning dangerous repositories and executing them without sufficient risk analysis. The cloned repository is checked by an LLM, and if deemed dangerous, the cloned directory is deleted.
+
+## Flow from clone to risk analysis
+- git clone
+- Clone the repository using git clone
+- Navigate to the cloned directory
+- Have OpenHands on a docker container determine if it's dangerous
+    - Instruct OpenHands to include strings in its output that indicate whether it's safe or dangerous
+- If OpenHands' output indicates danger, delete the repository directory
+
+The content of the risk analysis and the criteria strings used to determine safety/danger are completely dependent on prompts and user settings, and can be customized by the user.
+
+## Optimizing risk analysis with OpenHands
+
+Before having OpenHands on Docker perform risk analysis, we use yamadashy/repomix (https://github.com/yamadashy/repomix) to consolidate the repository code into one file (actually, if it's too large, we split the files again to fit within a certain line range), which improves the efficiency of LLM repository reading.
+
+## Parsing OpenHands output
+The logs when running OpenHands on docker are not always structured, but they follow certain patterns. At the end of OpenHands' risk analysis, there is an output like `AgentFinishAction(final_thought='<codebase analysis result>')`. By extracting the analysis result from here, we can determine if it's safe/dangerous.
+However, this is not mandatory, and a more accurate implementation may be possible depending on OpenHands' output.
+
+## Shell script writing style
+
+Focus on writing robust code by using `set -e`, `set -u` whenever possible, avoiding `eval` when possible, etc.

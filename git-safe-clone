@@ -17,6 +17,18 @@ usage() {
     echo ""
     echo "A safer git clone that checks repositories for malicious code before allowing use."
     echo "If the repository is deemed unsafe, the cloned directory will be removed."
+    echo ""
+    echo "Configuration:"
+    echo "  Git config:"
+    echo "    git config --global safeclone.apiKeyEnv \"YOUR_API_KEY_ENV_NAME\""
+    echo "    git config --global safeclone.model \"your_preferred_model\""
+    echo "    git config --global safeclone.runtimeImage \"docker.all-hands.dev/all-hands-ai/runtime:0.28-nikolaik\""
+    echo "    git config --global safeclone.containerImage \"docker.all-hands.dev/all-hands-ai/openhands:0.28\""
+    echo "    git config --global safeclone.prompt \"Your custom security analysis prompt\""
+    echo "    git config --global safeclone.safeMarker \"This codebase is SAFE to execute\""
+    echo "    git config --global safeclone.unsafeMarker \"This codebase is UNSAFE to execute\""
+    echo "    git config --global safeclone.maxChunkSize \"50000\" (lines per chunk for large repositories)"
+    echo "    git config --global safeclone.preAnalysisHook \"/path/to/your/script.sh\" (custom script to run before analysis)"
     exit 1
 }
 
@@ -31,44 +43,156 @@ contains() {
     fi
 }
 
+# Function to get a value from git config
+get_git_config() {
+    local key="$1"
+    local default_value="$2"
+    local value
+
+    value=$(git config --get "$key" 2>/dev/null)
+
+    if [ -n "$value" ]; then
+        echo "$value"
+    else
+        echo "$default_value"
+    fi
+}
+
+# Function to get the value of a variable by its name
+get_var_value() {
+    local var_name="$1"
+    echo "${!var_name}"
+}
+
 # Function to parse OpenHands output and determine if the repository is safe
 check_safety() {
     log_file="$1"
 
     # Extract the final_thought from AgentFinishAction
-    final_thought=$(grep -A 20 "AgentFinishAction" "$log_file" | grep "final_thought=" | sed -E 's/.*final_thought='\''([^'\'']*).*/\1/')
+    final_thought=$(grep -A 100 "AgentFinishAction" "$log_file" | grep "final_thought=" | sed -E 's/.*final_thought='\''([^'\'']*).*/\1/')
 
     # Check if the repository is deemed safe or unsafe
-    if contains "$final_thought" "This codebase is SAFE to execute"; then
+    if contains "$final_thought" "$GIT_SAFE_CLONE_SAFE_MARKER"; then
         echo "Repository is deemed SAFE."
-        return 0
-    elif contains "$final_thought" "This codebase is UNSAFE to execute"; then
+        return 0 # 0 = true = safe
+    elif contains "$final_thought" "$GIT_SAFE_CLONE_UNSAFE_MARKER"; then
         echo "Repository is deemed UNSAFE!"
-        return 0
+        return 1 # 1 = false = unsafe
     else
         echo "Failed to determine repository safety."
-        return 1
+        return 1 # 1 = false = unsafe (default to unsafe if uncertain)
     fi
 }
 
-# Check if LLM_API_KEY is set
-if [ -z "$LLM_API_KEY" ]; then
-    echo -e "${RED}Error: LLM_API_KEY environment variable is not set.${NC}"
-    echo -e "Please set it with: ${YELLOW}export LLM_API_KEY=\"your_api_key_here\"${NC}"
+# Function to split a file into chunks of specified size
+split_file() {
+    local file="$1"
+    local chunk_size="$2"
+    local output_dir="$3"
+    local base_name=$(basename "$file")
+
+    mkdir -p "$output_dir"
+
+    # Count total lines in the file
+    local total_lines=$(wc -l <"$file")
+    local chunk_count=$(((total_lines + chunk_size - 1) / chunk_size))
+
+    echo "Splitting $file into $chunk_count chunks of approximately $chunk_size lines each..."
+
+    # Split the file into chunks
+    split -l "$chunk_size" "$file" "${output_dir}/${base_name}.chunk-"
+
+    echo "Created $(ls "${output_dir}/${base_name}.chunk-"* | wc -l) chunk files in $output_dir"
+}
+
+# Function to clean up analysis files
+cleanup_analysis_files() {
+    local analysis_dir="$1"
+    local is_safe="$2"
+
+    if [ "$is_safe" = "true" ]; then
+        echo "Cleaning up analysis files..."
+        rm -rf "$analysis_dir"
+    fi
+}
+
+# Get API key from environment variable specified in git config
+GIT_SAFE_CLONE_LLM_API_KEY=""
+
+# Get API key environment variable name from git config
+GIT_SAFE_CLONE_LLM_API_KEY_ENV=$(get_git_config "safeclone.apiKeyEnv" "")
+if [ -n "$GIT_SAFE_CLONE_LLM_API_KEY_ENV" ]; then
+    # Get the API key from the specified environment variable
+    GIT_SAFE_CLONE_LLM_API_KEY=$(get_var_value "$GIT_SAFE_CLONE_LLM_API_KEY_ENV")
+fi
+
+if [ -z "$GIT_SAFE_CLONE_LLM_API_KEY" ]; then
+    echo -e "${RED}Error: API key not found.${NC}"
+
+    if [ -n "$GIT_SAFE_CLONE_LLM_API_KEY_ENV" ]; then
+        # 環境変数名は設定されているが、その環境変数にAPIキーが設定されていない場合
+        echo -e "The environment variable ${YELLOW}$GIT_SAFE_CLONE_LLM_API_KEY_ENV${NC} is specified in git config but does not contain an API key."
+        echo -e "Please set your API key in this environment variable:"
+        echo -e "  ${YELLOW}export $GIT_SAFE_CLONE_LLM_API_KEY_ENV=\"your_api_key_here\"${NC}"
+    else
+        # 環境変数名が設定されていない場合
+        echo -e "Please specify the environment variable containing your API key with:"
+        echo -e "  ${YELLOW}git config --global safeclone.apiKeyEnv \"YOUR_API_KEY_ENV_NAME\"${NC}"
+        echo -e ""
+        echo -e "Then make sure the specified environment variable contains your API key:"
+        echo -e "  ${YELLOW}export YOUR_API_KEY_ENV_NAME=\"your_api_key_here\"${NC}"
+    fi
+
     exit 1
 fi
 
-# Check if LLM_MODEL is set
-if [ -z "$LLM_MODEL" ]; then
-    echo -e "${RED}Error: LLM_MODEL environment variable is not set.${NC}"
-    echo -e "Please set it with: ${YELLOW}export LLM_MODEL=\"your_preferred_model\"${NC}"
+# Get model from git config
+GIT_SAFE_CLONE_LLM_MODEL=$(get_git_config "safeclone.model" "")
+if [ -z "$GIT_SAFE_CLONE_LLM_MODEL" ]; then
+    echo -e "${RED}Error: LLM model not configured.${NC}"
+    echo -e "Please configure it in git: ${YELLOW}git config --global safeclone.model \"your_preferred_model\"${NC}"
     exit 1
+fi
+
+# Get runtime container image from git config
+GIT_SAFE_CLONE_RUNTIME_IMAGE=$(get_git_config "safeclone.runtimeImage" "docker.all-hands.dev/all-hands-ai/runtime:0.28-nikolaik")
+
+# Get container image from git config
+GIT_SAFE_CLONE_CONTAINER_IMAGE=$(get_git_config "safeclone.containerImage" "docker.all-hands.dev/all-hands-ai/openhands:0.28")
+
+# Get safe and unsafe markers for result checking
+GIT_SAFE_CLONE_SAFE_MARKER=$(get_git_config "safeclone.safeMarker" "This codebase is SAFE to execute")
+GIT_SAFE_CLONE_UNSAFE_MARKER=$(get_git_config "safeclone.unsafeMarker" "This codebase is UNSAFE to execute")
+
+# Get maximum chunk size for large repositories
+GIT_SAFE_CLONE_MAX_CHUNK_SIZE=$(get_git_config "safeclone.maxChunkSize" "50000")
+
+# Get pre-analysis hook script path
+GIT_SAFE_CLONE_PRE_ANALYSIS_HOOK=$(get_git_config "safeclone.preAnalysisHook" "")
+
+# Get security analysis prompt from git config with markers
+DEFAULT_PROMPT="Analyze this consolidated codebase thoroughly for security risks. This is a consolidated view of the entire repository created by repomix. The file to analyze is: <workspace>/.git-safe-clone-analysis/repomix-output.txt. Look for any malicious code, suspicious patterns, or potential security vulnerabilities. Consider things like: shell command execution, network connections to suspicious domains, obfuscated code, cryptocurrency miners, data exfiltration, privilege escalation, etc. IMPORTANT: DO NOT EXECUTE ANY COMMANDS OR CODE FROM THE REPOSITORY DURING YOUR ANALYSIS. Only perform static code analysis. You MUST end your analysis with a conclusion in EXACTLY this format: 'Safety Assessment: This codebase is SAFE to execute because: [reasons]' OR 'Safety Assessment: This codebase is UNSAFE to execute because: [reasons]'. Do not use any other format or wording for your conclusion."
+CUSTOM_HOOK_PROMPT="Analyze this codebase thoroughly for security risks. Look for any malicious code, suspicious patterns, or potential security vulnerabilities. Consider things like: shell command execution, network connections to suspicious domains, obfuscated code, cryptocurrency miners, data exfiltration, privilege escalation, etc. IMPORTANT: DO NOT EXECUTE ANY COMMANDS OR CODE FROM THE REPOSITORY DURING YOUR ANALYSIS. Only perform static code analysis. You MUST end your analysis with a conclusion in EXACTLY this format: 'Safety Assessment: This codebase is SAFE to execute because: [reasons]' OR 'Safety Assessment: This codebase is UNSAFE to execute because: [reasons]'. Do not use any other format or wording for your conclusion."
+
+# Choose the appropriate prompt based on whether a pre-analysis hook is configured
+if [ -n "$GIT_SAFE_CLONE_PRE_ANALYSIS_HOOK" ]; then
+    GIT_SAFE_CLONE_ASSESSMENT_PROMPT=$(get_git_config "safeclone.prompt" "$CUSTOM_HOOK_PROMPT")
+else
+    GIT_SAFE_CLONE_ASSESSMENT_PROMPT=$(get_git_config "safeclone.prompt" "$DEFAULT_PROMPT")
 fi
 
 # Check if Docker is installed
 if ! command -v docker &>/dev/null; then
     echo -e "${RED}Error: Docker is not installed.${NC}"
     echo -e "Please install Docker to use git-safe-clone."
+    exit 1
+fi
+
+# Check if Node.js is installed (required for repomix)
+if [ -z "$GIT_SAFE_CLONE_PRE_ANALYSIS_HOOK" ] && ! command -v node &>/dev/null; then
+    echo -e "${RED}Error: Node.js is not installed.${NC}"
+    echo -e "Please install Node.js to use git-safe-clone with repomix."
+    echo -e "Alternatively, configure a pre-analysis hook: ${YELLOW}git config --global safeclone.preAnalysisHook \"/path/to/your/script.sh\"${NC}"
     exit 1
 fi
 
@@ -107,41 +231,188 @@ LOG_FILE=$(mktemp /tmp/openhands-log-XXXXXX.txt)
 
 echo "Analyzing repository for safety..."
 
-# Run OpenHands to analyze the repository
-docker run -it \
-    --pull=always \
-    -e SANDBOX_RUNTIME_CONTAINER_IMAGE=docker.all-hands.dev/all-hands-ai/runtime:0.28-nikolaik \
-    -e SANDBOX_USER_ID=$(id -u) \
-    -e SANDBOX_USE_HOST_NETWORK=true \
-    -e WORKSPACE_MOUNT_PATH=$WORKSPACE_BASE \
-    -e LLM_API_KEY=$LLM_API_KEY \
-    -e LLM_MODEL=$LLM_MODEL \
-    -e LOG_ALL_EVENTS=true \
-    -v $WORKSPACE_BASE:/opt/workspace_base \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v ~/.openhands-state:/.openhands-state \
-    --add-host host.docker.internal:host-gateway \
-    --name openhands-app-$(date +%Y%m%d%H%M%S) \
-    docker.all-hands.dev/all-hands-ai/openhands:0.28 \
-    python -m openhands.core.main -t "Analyze this codebase thoroughly for security risks. Look for any malicious code, suspicious patterns, or potential security vulnerabilities. Consider things like: shell command execution, network connections to suspicious domains, obfuscated code, cryptocurrency miners, data exfiltration, privilege escalation, etc. Clearly state if you think this codebase is SAFE or UNSAFE to execute. Format your final conclusion as 'Safety Assessment: This codebase is [SAFE/UNSAFE] to execute because: [reasons]'" |
-    tee "$LOG_FILE"
+# Display configuration settings
+echo -e "${YELLOW}Configuration:${NC}"
+echo -e "  LLM Model: ${GREEN}$GIT_SAFE_CLONE_LLM_MODEL${NC} (from git config)"
+echo -e "  API Key Source: ${GREEN}Environment variable $GIT_SAFE_CLONE_LLM_API_KEY_ENV${NC}"
+echo -e "  Workspace: ${GREEN}$WORKSPACE_BASE${NC}"
+echo -e "  Container Image: ${GREEN}$GIT_SAFE_CLONE_CONTAINER_IMAGE${NC}"
+echo -e "  Runtime Image: ${GREEN}$GIT_SAFE_CLONE_RUNTIME_IMAGE${NC}"
+echo -e "  Safe Marker: ${GREEN}$GIT_SAFE_CLONE_SAFE_MARKER${NC}"
+echo -e "  Unsafe Marker: ${GREEN}$GIT_SAFE_CLONE_UNSAFE_MARKER${NC}"
+if [ -z "$GIT_SAFE_CLONE_PRE_ANALYSIS_HOOK" ]; then
+    echo -e "  Max Chunk Size: ${GREEN}$GIT_SAFE_CLONE_MAX_CHUNK_SIZE${NC} lines"
+else
+    echo -e "  Pre-Analysis Hook: ${GREEN}$GIT_SAFE_CLONE_PRE_ANALYSIS_HOOK${NC}"
+fi
+echo -e "  Prompt: ${GREEN}$GIT_SAFE_CLONE_ASSESSMENT_PROMPT${NC}"
+echo ""
+
+# Change to the cloned directory
+cd "$WORKSPACE_BASE"
+
+# Create analysis directory
+ANALYSIS_DIR="$WORKSPACE_BASE/.git-safe-clone-analysis"
+mkdir -p "$ANALYSIS_DIR"
+
+# Determine whether to use the pre-analysis hook or repomix
+if [ -n "$GIT_SAFE_CLONE_PRE_ANALYSIS_HOOK" ]; then
+    # Use the pre-analysis hook
+    echo "Running pre-analysis hook: $GIT_SAFE_CLONE_PRE_ANALYSIS_HOOK"
+
+    # Check if the hook script exists and is executable
+    if [ ! -f "$GIT_SAFE_CLONE_PRE_ANALYSIS_HOOK" ]; then
+        echo -e "${RED}Error: Pre-analysis hook script not found: $GIT_SAFE_CLONE_PRE_ANALYSIS_HOOK${NC}"
+        cd ..
+        rm -rf "$WORKSPACE_BASE"
+        exit 1
+    fi
+
+    if [ ! -x "$GIT_SAFE_CLONE_PRE_ANALYSIS_HOOK" ]; then
+        echo -e "${RED}Error: Pre-analysis hook script is not executable: $GIT_SAFE_CLONE_PRE_ANALYSIS_HOOK${NC}"
+        echo -e "Please make it executable with: ${YELLOW}chmod +x $GIT_SAFE_CLONE_PRE_ANALYSIS_HOOK${NC}"
+        cd ..
+        rm -rf "$WORKSPACE_BASE"
+        exit 1
+    fi
+
+    # Execute the hook script with the workspace path and analysis directory as arguments
+    "$GIT_SAFE_CLONE_PRE_ANALYSIS_HOOK" "$WORKSPACE_BASE" "$ANALYSIS_DIR"
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Error: Pre-analysis hook script failed.${NC}"
+        cd ..
+        rm -rf "$WORKSPACE_BASE"
+        exit 1
+    fi
+
+    # Run OpenHands with the custom hook prompt
+    echo -e "\n${YELLOW}Analyzing the repository using pre-analysis hook...${NC}"
+
+    docker run -it \
+        --pull=always \
+        -e SANDBOX_RUNTIME_CONTAINER_IMAGE=$GIT_SAFE_CLONE_RUNTIME_IMAGE \
+        -e SANDBOX_USER_ID=$(id -u) \
+        -e SANDBOX_USE_HOST_NETWORK=true \
+        -e WORKSPACE_MOUNT_PATH=$WORKSPACE_BASE \
+        -e LLM_API_KEY=$GIT_SAFE_CLONE_LLM_API_KEY \
+        -e LLM_MODEL=$GIT_SAFE_CLONE_LLM_MODEL \
+        -e LOG_ALL_EVENTS=true \
+        -v $WORKSPACE_BASE:/opt/workspace_base \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v ~/.openhands-state:/.openhands-state \
+        --add-host host.docker.internal:host-gateway \
+        --name openhands-app-$(date +%Y%m%d%H%M%S) \
+        $GIT_SAFE_CLONE_CONTAINER_IMAGE python -m openhands.core.main -t "$GIT_SAFE_CLONE_ASSESSMENT_PROMPT" |
+        tee "$LOG_FILE"
+else
+    # Use repomix for code consolidation
+    echo "Consolidating repository code with repomix..."
+    REPOMIX_OUTPUT="$ANALYSIS_DIR/repomix-output.txt"
+    npx repomix -o "$REPOMIX_OUTPUT"
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Error: Failed to run repomix.${NC}"
+        echo -e "Please make sure repomix is available via npx."
+        cd ..
+        rm -rf "$WORKSPACE_BASE"
+        exit 1
+    fi
+
+    # Check if repomix output exists and is not empty
+    if [ ! -s "$REPOMIX_OUTPUT" ]; then
+        echo -e "${RED}Error: repomix output is empty.${NC}"
+        cd ..
+        rm -rf "$WORKSPACE_BASE"
+        exit 1
+    fi
+
+    # Get the size of the repomix output
+    REPOMIX_SIZE=$(wc -l <"$REPOMIX_OUTPUT")
+    echo "Repomix output size: $REPOMIX_SIZE lines"
+
+    # Determine if we need to split the file
+    if [ "$REPOMIX_SIZE" -gt "$GIT_SAFE_CLONE_MAX_CHUNK_SIZE" ]; then
+        echo "Repomix output is large, splitting into chunks..."
+        CHUNKS_DIR="$ANALYSIS_DIR/chunks"
+        split_file "$REPOMIX_OUTPUT" "$GIT_SAFE_CLONE_MAX_CHUNK_SIZE" "$CHUNKS_DIR"
+
+        # Count the number of chunks
+        CHUNK_COUNT=$(ls "${CHUNKS_DIR}/repomix-output.txt.chunk-"* | wc -l)
+
+        # Create a custom prompt that includes information about the chunks
+        CHUNK_PROMPT="This is a consolidated view of the entire repository created by repomix. The repository code has been split into $CHUNK_COUNT chunks due to its size. Please analyze all chunks in the directory '.git-safe-clone-analysis/chunks/' for security risks. Each chunk file follows the pattern 'repomix-output.txt.chunk-*'. Look for any malicious code, suspicious patterns, or potential security vulnerabilities. Consider things like: shell command execution, network connections to suspicious domains, obfuscated code, cryptocurrency miners, data exfiltration, privilege escalation, etc. IMPORTANT: DO NOT EXECUTE ANY COMMANDS OR CODE FROM THE REPOSITORY DURING YOUR ANALYSIS. Only perform static code analysis. You MUST end your analysis with a conclusion in EXACTLY this format: 'Safety Assessment: This codebase is SAFE to execute because: [reasons]' OR 'Safety Assessment: This codebase is UNSAFE to execute because: [reasons]'. Do not use any other format or wording for your conclusion."
+
+        # Run OpenHands once with the custom prompt
+        echo -e "\n${YELLOW}Analyzing all chunks with a single OpenHands run...${NC}"
+
+        docker run -it \
+            --pull=always \
+            -e SANDBOX_RUNTIME_CONTAINER_IMAGE=$GIT_SAFE_CLONE_RUNTIME_IMAGE \
+            -e SANDBOX_USER_ID=$(id -u) \
+            -e SANDBOX_USE_HOST_NETWORK=true \
+            -e WORKSPACE_MOUNT_PATH=$WORKSPACE_BASE \
+            -e LLM_API_KEY=$GIT_SAFE_CLONE_LLM_API_KEY \
+            -e LLM_MODEL=$GIT_SAFE_CLONE_LLM_MODEL \
+            -e LOG_ALL_EVENTS=true \
+            -v $WORKSPACE_BASE:/opt/workspace_base \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v ~/.openhands-state:/.openhands-state \
+            --add-host host.docker.internal:host-gateway \
+            --name openhands-app-$(date +%Y%m%d%H%M%S) \
+            $GIT_SAFE_CLONE_CONTAINER_IMAGE python -m openhands.core.main -t "$CHUNK_PROMPT" |
+            tee "$LOG_FILE"
+    else
+        # Run OpenHands once with the default prompt
+        echo -e "\n${YELLOW}Analyzing the consolidated repository code...${NC}"
+
+        docker run -it \
+            --pull=always \
+            -e SANDBOX_RUNTIME_CONTAINER_IMAGE=$GIT_SAFE_CLONE_RUNTIME_IMAGE \
+            -e SANDBOX_USER_ID=$(id -u) \
+            -e SANDBOX_USE_HOST_NETWORK=true \
+            -e WORKSPACE_MOUNT_PATH=$WORKSPACE_BASE \
+            -e LLM_API_KEY=$GIT_SAFE_CLONE_LLM_API_KEY \
+            -e LLM_MODEL=$GIT_SAFE_CLONE_LLM_MODEL \
+            -e LOG_ALL_EVENTS=true \
+            -v $WORKSPACE_BASE:/opt/workspace_base \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v ~/.openhands-state:/.openhands-state \
+            --add-host host.docker.internal:host-gateway \
+            --name openhands-app-$(date +%Y%m%d%H%M%S) \
+            $GIT_SAFE_CLONE_CONTAINER_IMAGE python -m openhands.core.main -t "$GIT_SAFE_CLONE_ASSESSMENT_PROMPT" |
+            tee "$LOG_FILE"
+    fi
+fi
 
 # Check if the repository is safe
 if check_safety "$LOG_FILE"; then
-    echo "Repository has been cloned and verified as safe: $WORKSPACE_BASE"
+    echo -e "\n${GREEN}✅ SAFE: Repository has been verified as secure${NC}"
+    echo -e "${GREEN}===================================================${NC}"
+    echo -e "${GREEN}Repository location: $WORKSPACE_BASE${NC}"
+    echo -e "${GREEN}You can safely work with this repository now.${NC}"
+    echo -e "${GREEN}===================================================${NC}"
+
+    # Clean up analysis files
+    cleanup_analysis_files "$ANALYSIS_DIR" "true"
+
     # Clean up the log file
     rm "$LOG_FILE"
     exit 0
 else
-    echo "WARNING: Repository has been identified as potentially unsafe!"
-    echo "Removing cloned directory: $WORKSPACE_BASE"
+    echo -e "\n${RED}❌ UNSAFE: Security analysis detected potential threats!${NC}"
+    echo -e "${RED}===================================================${NC}"
+    echo -e "${RED}SECURITY ALERT: This repository may contain suspicious code${NC}"
+    echo -e "${RED}Action taken: Removing cloned directory: $WORKSPACE_BASE${NC}"
+    echo -e "${RED}===================================================${NC}"
 
     # Remove the cloned directory
+    cd ..
     rm -rf "$WORKSPACE_BASE"
 
     # Clean up the log file
     rm "$LOG_FILE"
 
-    echo "Operation aborted for your safety."
+    echo -e "${RED}Operation aborted for your safety.${NC}"
     exit 1
 fi
