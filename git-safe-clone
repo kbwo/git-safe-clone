@@ -69,8 +69,8 @@ check_safety() {
     log_file="$1"
 
     # Extract the final_thought from AgentFinishAction
-    final_thought=$(grep -A 100 "AgentFinishAction" "$log_file" | grep "final_thought=" | sed -E 's/.*final_thought='\''([^'\'']*).*/\1/')
-
+    final_thought=$(grep -A 100 "AgentFinishAction" "$log_file" | grep "final_thought=" | sed -E 's/.*final_thought='\''(.*)'\''.*/\1/')
+    
     # Check if the repository is deemed safe or unsafe
     if contains "$final_thought" "$GIT_SAFE_CLONE_SAFE_MARKER"; then
         echo "Repository is deemed SAFE."
